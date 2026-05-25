@@ -1,22 +1,44 @@
 #!/usr/bin/env node
 
-"use strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import chalk from "chalk";
+import { program } from "commander";
+import envinfo from "envinfo";
 
-const fs = require("fs");
-const util = require("util");
-const path = require("path");
-const program = require("commander");
-const chalk = require("chalk");
-const envinfo = require("envinfo");
-const packageJson = require("./package.json");
-const serve = require("./lib/server");
-const constants = require("./lib/constants");
-const stat = util.promisify(fs.stat);
+import packageJson from "./package.json" with { type: "json" };
+import serve from "./lib/server.js";
+import constants from "./lib/constants.js";
+
+function parsePort(value) {
+  const port = Number.parseInt(value, 10);
+
+  if (Number.isNaN(port) || port < 0 || port > 65535) {
+    throw new Error(`Invalid port "${value}". Expected a number from 0 to 65535.`);
+  }
+
+  return port;
+}
+
+function reportError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  process.exitCode = 1;
+}
+
+function addServeOptions(command) {
+  return command
+    .option("-p, --port <port>", "port to use in serving the file", parsePort, 0)
+    .option("-H, --host <host>", "bind to a specific host or IPv4 address")
+    .option("-i, --interface <name>", "bind to the first IPv4 address on a specific interface");
+}
 
 program
+  .name("qrscp")
   .version(packageJson.version)
   .option("--verbose", "print additional logs")
   .option("--info", "print environment debug info")
+  .showHelpAfterError()
   .on("--help", () => {
     console.log();
     console.log(`If you have any problems, do not hesitate to file an issue:`);
@@ -24,61 +46,83 @@ program
     console.log();
   });
 
-program
-  .command("transfer <file>")
+addServeOptions(
+  program.command("transfer <file>")
   .description("transfer the given file")
-  .option("-p, --port [port]", "port to use in serving the file")
-  .action((file, options) => {
-    const port = options.port || 0;
-    const source = path.resolve(file);
+).action(async (file, options) => {
+  const source = path.resolve(file);
 
-    stat(source)
-      .then(stats => {
-        if (stats.isFile()) {
-          serve({
-            source,
-            port
-          });
-        }
+  try {
+    const stats = await fs.stat(source);
 
-        if (stats.isDirectory()) {
-          console.log("Its a directory");
-        }
-      })
-      .catch(console.log);
-  })
+    if (stats.isDirectory()) {
+      throw new Error(
+        `Directory transfer is not supported yet: ${source}\nPass a file instead.`
+      );
+    }
+
+    if (!stats.isFile()) {
+      throw new Error(`Unsupported transfer source: ${source}`);
+    }
+
+    await serve({
+      source,
+      port: options.port,
+      host: options.host,
+      interfaceName: options.interface
+    });
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      reportError(`File not found: ${source}`);
+      return;
+    }
+
+    reportError(error);
+  }
+})
   .on("--help", () => {
     console.log();
     console.log("Examples:");
     console.log("  qrscp transfer profile.png");
     console.log("  qrscp transfer --port 8080 profile.png");
+    console.log("  qrscp transfer --interface en0 profile.png");
+    console.log("  qrscp transfer --host 192.168.1.10 profile.png");
     console.log();
   });
 
-program
-  .command("receive <directory>")
+addServeOptions(
+  program.command("receive <directory>")
   .description("receive the transferred file to the given directory")
-  .option("-p, --port [port]", "port to use in serving the file")
-  .action((directory, options) => {
-    const port = options.port || 0;
-    const source = path.resolve(directory);
+).action(async (directory, options) => {
+  const source = path.resolve(directory);
 
-    stat(source)
-      .then(stats => {
-        if (stats.isDirectory()) {
-          serve({
-            action: constants.ACTION_RECEIVE,
-            source,
-            port
-          });
-        }
+  try {
+    const stats = await fs.stat(source);
 
-        if (stats.isFile()) {
-          throw new Error("Specify a directory to receive file.");
-        }
-      })
-      .catch(console.log);
-  });
+    if (stats.isFile()) {
+      throw new Error(`Specify a directory to receive files: ${source}`);
+    }
+
+    if (!stats.isDirectory()) {
+      throw new Error(`Unsupported receive destination: ${source}`);
+    }
+
+    await serve({
+      action: constants.ACTION_RECEIVE,
+      source,
+      port: options.port,
+      host: options.host,
+      interfaceName: options.interface
+    });
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      reportError(`Directory not found: ${source}`);
+      return;
+    }
+
+    reportError(error);
+  }
+});
 
 program.on("command:*", function() {
   console.error(
@@ -89,9 +133,11 @@ program.on("command:*", function() {
 
 program.parse(process.argv);
 
-if (program && typeof program.info !== "undefined") {
+const globalOptions = program.opts();
+
+if (globalOptions && typeof globalOptions.info !== "undefined" && globalOptions.info) {
   console.log(`\n${chalk.bold("Environment Info:")}`);
-  return envinfo
+  envinfo
     .run(
       {
         System: ["OS", "CPU"],
